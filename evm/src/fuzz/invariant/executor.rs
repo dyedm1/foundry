@@ -15,7 +15,7 @@ use crate::{
         },
         FuzzCase, FuzzedCases,
     },
-    utils::get_function,
+    utils::{get_function, h160_to_b160},
     CALLER,
 };
 use ethers::{
@@ -24,14 +24,14 @@ use ethers::{
 };
 use eyre::ContextCompat;
 use foundry_common::contracts::{ContractsByAddress, ContractsByArtifact};
-use foundry_config::InvariantConfig;
+use foundry_config::{FuzzDictionaryConfig, InvariantConfig};
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
 use proptest::{
     strategy::{BoxedStrategy, Strategy, ValueTree},
     test_runner::{TestCaseError, TestRunner},
 };
-use revm::DatabaseCommit;
+use revm::{primitives::B160, DatabaseCommit};
 use std::{cell::RefCell, collections::BTreeMap, sync::Arc};
 use tracing::warn;
 
@@ -157,8 +157,7 @@ impl<'a> InvariantExecutor<'a> {
                         sender,
                         &call_result,
                         fuzz_state.clone(),
-                        self.config.include_storage,
-                        self.config.include_push_bytes,
+                        &self.config.dictionary,
                     );
 
                     if let Err(error) = collect_created_contracts(
@@ -220,7 +219,7 @@ impl<'a> InvariantExecutor<'a> {
             });
         }
 
-        tracing::trace!(target: "forge::test::invariant::dictionary", "{:?}", fuzz_state.read().iter().map(hex::encode).collect::<Vec<_>>());
+        tracing::trace!(target: "forge::test::invariant::dictionary", "{:?}", fuzz_state.read().values().iter().map(hex::encode).collect::<Vec<_>>());
 
         let (reverts, invariants) = failures.into_inner().into_inner();
 
@@ -250,11 +249,8 @@ impl<'a> InvariantExecutor<'a> {
         }
 
         // Stores fuzz state for use with [fuzz_calldata_from_state].
-        let fuzz_state: EvmFuzzState = build_initial_state(
-            self.executor.backend().mem_db(),
-            self.config.include_storage,
-            self.config.include_push_bytes,
-        );
+        let fuzz_state: EvmFuzzState =
+            build_initial_state(self.executor.backend().mem_db(), &self.config.dictionary);
 
         // During execution, any newly created contract is added here and used through the rest of
         // the fuzz run.
@@ -266,7 +262,7 @@ impl<'a> InvariantExecutor<'a> {
             fuzz_state.clone(),
             targeted_senders,
             targeted_contracts.clone(),
-            self.config.dictionary_weight,
+            self.config.dictionary.dictionary_weight,
         )
         .no_shrink()
         .boxed();
@@ -525,16 +521,16 @@ impl<'a> InvariantExecutor<'a> {
 /// before inserting it into the dictionary. Otherwise, we flood the dictionary with
 /// randomly generated addresses.
 fn collect_data(
-    state_changeset: &mut HashMap<Address, revm::Account>,
+    state_changeset: &mut HashMap<B160, revm::primitives::Account>,
     sender: &Address,
     call_result: &RawCallResult,
     fuzz_state: EvmFuzzState,
-    include_storage: bool,
-    include_push_bytes: bool,
+    config: &FuzzDictionaryConfig,
 ) {
     // Verify it has no code.
     let mut has_code = false;
-    if let Some(Some(code)) = state_changeset.get(sender).map(|account| account.info.code.as_ref())
+    if let Some(Some(code)) =
+        state_changeset.get(&h160_to_b160(*sender)).map(|account| account.info.code.as_ref())
     {
         has_code = !code.is_empty();
     }
@@ -542,20 +538,14 @@ fn collect_data(
     // We keep the nonce changes to apply later.
     let mut sender_changeset = None;
     if !has_code {
-        sender_changeset = state_changeset.remove(sender);
+        sender_changeset = state_changeset.remove(&h160_to_b160(*sender));
     }
 
-    collect_state_from_call(
-        &call_result.logs,
-        &*state_changeset,
-        fuzz_state,
-        include_storage,
-        include_push_bytes,
-    );
+    collect_state_from_call(&call_result.logs, &*state_changeset, fuzz_state, config);
 
     // Re-add changes
     if let Some(changed) = sender_changeset {
-        state_changeset.insert(*sender, changed);
+        state_changeset.insert(h160_to_b160(*sender), changed);
     }
 }
 

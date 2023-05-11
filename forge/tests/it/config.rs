@@ -5,10 +5,12 @@ use crate::test_helpers::{
 };
 use forge::{result::SuiteResult, MultiContractRunner, MultiContractRunnerBuilder, TestOptions};
 use foundry_config::{
-    fs_permissions::PathPermission, Config, FsPermissions, FuzzConfig, InvariantConfig,
-    RpcEndpoint, RpcEndpoints,
+    fs_permissions::PathPermission, Config, FsPermissions, FuzzConfig, FuzzDictionaryConfig,
+    InvariantConfig, RpcEndpoint, RpcEndpoints,
 };
-use foundry_evm::{decode::decode_console_logs, executor::inspector::CheatsConfig};
+use foundry_evm::{
+    decode::decode_console_logs, executor::inspector::CheatsConfig, revm::primitives::SpecId,
+};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -35,6 +37,11 @@ impl TestConfig {
 
     pub fn filter(filter: Filter) -> Self {
         Self { filter, ..Default::default() }
+    }
+
+    pub fn evm_spec(mut self, spec: SpecId) -> Self {
+        self.runner.evm_spec = spec;
+        self
     }
 
     pub fn should_fail(self) -> Self {
@@ -98,20 +105,26 @@ pub static TEST_OPTS: TestOptions = TestOptions {
         runs: 256,
         max_test_rejects: 65536,
         seed: None,
-        include_storage: true,
-        include_push_bytes: true,
-        max_fuzz_dictionary_addresses: 10_000,
-        dictionary_weight: 40,
-        max_fuzz_dictionary_values: 10_000,
+        dictionary: FuzzDictionaryConfig {
+            include_storage: true,
+            include_push_bytes: true,
+            dictionary_weight: 40,
+            max_fuzz_dictionary_addresses: 10_000,
+            max_fuzz_dictionary_values: 10_000,
+        },
     },
     invariant: InvariantConfig {
         runs: 256,
         depth: 15,
-        dictionary_weight: 80,
         fail_on_revert: false,
         call_override: false,
-        include_storage: true,
-        include_push_bytes: true,
+        dictionary: FuzzDictionaryConfig {
+            dictionary_weight: 80,
+            include_storage: true,
+            include_push_bytes: true,
+            max_fuzz_dictionary_addresses: 10_000,
+            max_fuzz_dictionary_values: 10_000,
+        },
     },
 };
 

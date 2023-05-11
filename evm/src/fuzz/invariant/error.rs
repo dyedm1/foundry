@@ -6,7 +6,10 @@ use crate::{
     trace::{load_contracts, TraceKind, Traces},
     CALLER,
 };
-use ethers::{abi::Function, types::Address};
+use ethers::{
+    abi::Function,
+    types::{Address, U256},
+};
 use eyre::{Result, WrapErr};
 use foundry_common::contracts::{ContractsByAddress, ContractsByArtifact};
 use proptest::test_runner::TestError;
@@ -14,6 +17,8 @@ use tracing::trace;
 
 #[derive(Debug, Clone)]
 pub struct InvariantFuzzError {
+    pub logs: Vec<Log>,
+    pub traces: Option<CallTraceArena>,
     /// The proptest error occurred as a result of a test case.
     pub test_error: TestError<Vec<BasicTxDetails>>,
     /// The return reason of the offending call.
@@ -47,6 +52,8 @@ impl InvariantFuzzError {
         }
 
         InvariantFuzzError {
+            logs: call_result.logs,
+            traces: call_result.traces,
             test_error: proptest::test_runner::TestError::Fail(
                 format!(
                     "{}, reason: '{}'",
@@ -102,7 +109,7 @@ impl InvariantFuzzError {
         // Replay each call from the sequence until we break the invariant.
         for (sender, (addr, bytes)) in calls.iter() {
             let call_result = executor
-                .call_raw_committing(*sender, *addr, bytes.0.clone(), 0.into())
+                .call_raw_committing(*sender, *addr, bytes.0.clone(), U256::zero())
                 .expect("bad call to evm");
 
             logs.extend(call_result.logs);
@@ -128,12 +135,10 @@ impl InvariantFuzzError {
             // Checks the invariant.
             if let Some(func) = &self.func {
                 let error_call_result = executor
-                    .call_raw(CALLER, self.addr, func.0.clone(), 0.into())
+                    .call_raw(CALLER, self.addr, func.0.clone(), U256::zero())
                     .expect("bad call to evm");
 
                 if error_call_result.reverted {
-                    logs.extend(error_call_result.logs);
-                    traces.push((TraceKind::Execution, error_call_result.traces.unwrap()));
                     break
                 }
             }
