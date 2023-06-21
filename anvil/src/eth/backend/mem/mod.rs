@@ -781,7 +781,14 @@ impl Backend {
         let (outcome, header, block_hash) = {
             let current_base_fee = self.base_fee();
 
-            let mut env = self.env.read().clone();
+            let mut env = self.env().read().clone();
+
+            if env.block.basefee == revm::primitives::U256::ZERO {
+                // this is an edge case because the evm fails if `tx.effective_gas_price < base_fee`
+                // 0 is only possible if it's manually set
+                env.cfg.disable_base_fee = true;
+            }
+
             // increase block number for this block
             env.block.number = env.block.number.saturating_add(rU256::from(1));
             env.block.basefee = current_base_fee.into();
@@ -1014,6 +1021,13 @@ impl Backend {
             nonce: nonce.map(|n| n.as_u64()),
             access_list: to_revm_access_list(access_list.unwrap_or_default()),
         };
+
+        if env.block.basefee == revm::primitives::U256::ZERO {
+            // this is an edge case because the evm fails if `tx.effective_gas_price < base_fee`
+            // 0 is only possible if it's manually set
+            env.cfg.disable_base_fee = true;
+        }
+
         env
     }
 
@@ -1595,7 +1609,6 @@ impl Backend {
 
                     block.number = block_number.into();
                     block.timestamp = rU256::from(fork.timestamp());
-                    block.difficulty = fork.total_difficulty().into();
                     block.basefee = fork.base_fee().unwrap_or_default().into();
 
                     return Ok(f(Box::new(&gen_db), block))
