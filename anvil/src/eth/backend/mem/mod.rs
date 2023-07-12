@@ -70,10 +70,12 @@ use forge::{
 use foundry_evm::{
     decode::{decode_custom_error_args, decode_revert},
     executor::backend::{DatabaseError, DatabaseResult},
-    revm,
     revm::{
+        self,
         db::CacheDB,
-        primitives::{Account, CreateScheme, Env, Output, SpecId, TransactTo, TxEnv, KECCAK_EMPTY},
+        primitives::{
+            Account, CreateScheme, EVMError, Env, Output, SpecId, TransactTo, TxEnv, KECCAK_EMPTY,
+        },
     },
     utils::u256_to_h256_be,
 };
@@ -316,9 +318,8 @@ impl Backend {
     }
 
     /// If set to true will make every account impersonated
-    pub async fn auto_impersonate_account(&self, enabled: bool) -> DatabaseResult<()> {
+    pub async fn auto_impersonate_account(&self, enabled: bool) {
         self.cheats.set_auto_impersonate_account(enabled);
-        Ok(())
     }
 
     /// Returns the configured fork, if any
@@ -506,6 +507,11 @@ impl Backend {
     /// Returns true for post London
     pub fn is_eip1559(&self) -> bool {
         (self.spec_id() as u8) >= (SpecId::LONDON as u8)
+    }
+
+    /// Returns true for post Merge
+    pub fn is_eip3675(&self) -> bool {
+        (self.spec_id() as u8) >= (SpecId::MERGE as u8)
     }
 
     /// Returns true for post Berlin
@@ -842,7 +848,12 @@ impl Backend {
             // update block metadata
             storage.best_number = block_number;
             storage.best_hash = block_hash;
-            storage.total_difficulty = storage.total_difficulty.saturating_add(header.difficulty);
+            // Difficulty is removed and not used after Paris (aka TheMerge). Value is replaced with
+            // prevrandao. https://github.com/bluealloy/revm/blob/1839b3fce8eaeebb85025576f2519b80615aca1e/crates/interpreter/src/instructions/host_env.rs#L27
+            if !self.is_eip3675() {
+                storage.total_difficulty =
+                    storage.total_difficulty.saturating_add(header.difficulty);
+            }
 
             storage.blocks.insert(block_hash, block);
             storage.hashes.insert(block_number, block_hash);
@@ -1047,9 +1058,13 @@ impl Backend {
         evm.database(state);
         let result_and_state = match evm.inspect_ref(&mut inspector) {
             Ok(result_and_state) => result_and_state,
-            Err(_) => {
-                return Err(BlockchainError::InvalidTransaction(InvalidTransactionError::GasTooHigh))
-            }
+            Err(e) => match e {
+                EVMError::Transaction(invalid_tx) => {
+                    return Err(BlockchainError::InvalidTransaction(invalid_tx.into()))
+                }
+                EVMError::PrevrandaoNotSet => return Err(BlockchainError::PrevrandaoNotSet),
+                EVMError::Database(e) => return Err(BlockchainError::DatabaseError(e)),
+            },
         };
         let state = result_and_state.state;
         let state: hashbrown::HashMap<H160, Account> =

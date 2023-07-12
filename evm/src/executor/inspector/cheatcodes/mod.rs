@@ -1,11 +1,10 @@
 use self::{
     env::Broadcast,
     expect::{handle_expect_emit, handle_expect_revert, ExpectedCallType},
-    util::{check_if_fixed_gas_limit, process_create, BroadcastableTransactions},
+    util::{check_if_fixed_gas_limit, process_create, BroadcastableTransactions, MAGIC_SKIP_BYTES},
 };
 use crate::{
     abi::HEVMCalls,
-    error::SolError,
     executor::{
         backend::DatabaseExt, inspector::cheatcodes::env::RecordedLogs, CHEATCODE_ADDRESS,
         HARDHAT_CONSOLE_ADDRESS,
@@ -21,6 +20,7 @@ use ethers::{
     },
 };
 use foundry_common::evm::Breakpoints;
+use foundry_utils::error::SolError;
 use itertools::Itertools;
 use revm::{
     interpreter::{opcode, CallInputs, CreateInputs, Gas, InstructionResult, Interpreter},
@@ -114,6 +114,9 @@ pub struct Cheatcodes {
 
     /// Rememebered private keys
     pub script_wallets: Vec<LocalWallet>,
+
+    /// Whether the skip cheatcode was activated
+    pub skip: bool,
 
     /// Prank information
     pub prank: Option<Prank>,
@@ -591,7 +594,10 @@ where
                         // The gas matches, if provided
                         expected.gas.map_or(true, |gas| gas == call.gas_limit) &&
                         // The minimum gas matches, if provided
-                        expected.min_gas.map_or(true, |min_gas| min_gas <= call.gas_limit)
+                        expected.min_gas.map_or(true, |min_gas| min_gas <= call.gas_limit) &&
+                        // The expected depth is smaller than the actual depth,
+                        // which means we're in the subcalls of the call were we expect to find the matches.
+                        expected.depth < data.journaled_state.depth()
                     {
                         *actual_count += 1;
                     }
@@ -744,6 +750,14 @@ where
             return (status, remaining_gas, retdata)
         }
 
+        if data.journaled_state.depth() == 0 && self.skip {
+            return (
+                InstructionResult::Revert,
+                remaining_gas,
+                Error::custom_bytes(MAGIC_SKIP_BYTES).encode_error().0,
+            )
+        }
+
         // Clean up pranks
         if let Some(prank) = &self.prank {
             if data.journaled_state.depth() == prank.depth {
@@ -767,7 +781,16 @@ where
 
         // Handle expected reverts
         if let Some(expected_revert) = &self.expected_revert {
-            if data.journaled_state.depth() <= expected_revert.depth {
+            // Irrespective of whether a revert will be matched or not, disallow having expected
+            // reverts alongside expected emits or calls.
+            if !self.expected_calls.is_empty() || !self.expected_emits.is_empty() {
+                return (
+                    InstructionResult::Revert,
+                    remaining_gas,
+                    "Cannot expect a function to revert while trying to match expected calls or events.".to_string().encode().into(),
+                )
+            }
+            if data.journaled_state.depth() == expected_revert.depth {
                 let expected_revert = std::mem::take(&mut self.expected_revert).unwrap();
                 return match handle_expect_revert(
                     false,
@@ -818,14 +841,18 @@ where
             }
         }
 
-        // If the depth is 0, then this is the root call terminating
-        if data.journaled_state.depth() == 0 {
-            // Match expected calls
-            for (address, calldatas) in &self.expected_calls {
-                // Loop over each address, and for each address, loop over each calldata it expects.
-                for (calldata, (expected, actual_count)) in calldatas {
-                    // Grab the values we expect to see
-                    let ExpectedCallData { gas, min_gas, value, count, call_type } = expected;
+        // Match expected calls
+        for (address, calldatas) in &self.expected_calls {
+            // Loop over each address, and for each address, loop over each calldata it expects.
+            for (calldata, (expected, actual_count)) in calldatas {
+                // Grab the values we expect to see
+                let ExpectedCallData { gas, min_gas, value, count, call_type, depth } = expected;
+                // Only check calls in the corresponding depth,
+                // or if the expected depth is higher than the current depth. This is correct, as
+                // the expected depth can only be bigger than the current depth if
+                // we're either terminating the root call (the test itself), or exiting the intended
+                // call that contained the calls we expected to see.
+                if depth >= &data.journaled_state.depth() {
                     let calldata = Bytes::from(calldata.clone());
 
                     // We must match differently depending on the type of call we expect.
@@ -844,14 +871,15 @@ where
                                 .into_iter()
                                 .flatten()
                                 .join(" and ");
+                                let failure_message = match status {
+                                    InstructionResult::Continue | InstructionResult::Stop | InstructionResult::Return | InstructionResult::SelfDestruct =>
+                                    format!("Expected call to {address:?} with {expected_values} to be called {count} time(s), but was called {actual_count} time(s)"),
+                                    _ => format!("Expected call to {address:?} with {expected_values} to be called {count} time(s), but the call reverted instead. Ensure you're testing the happy path when using the expectCall cheatcode"),
+                                };
                                 return (
                                     InstructionResult::Revert,
                                     remaining_gas,
-                                    format!(
-                                        "Expected call to {address:?} with {expected_values} to be called {count} time(s), but was called {actual_count} time(s)"
-                                    )
-                                    .encode()
-                                    .into(),
+                                    failure_message.encode().into(),
                                 )
                             }
                         }
@@ -870,19 +898,32 @@ where
                                 .into_iter()
                                 .flatten()
                                 .join(" and ");
+                                let failure_message = match status {
+                                    InstructionResult::Continue | InstructionResult::Stop | InstructionResult::Return | InstructionResult::SelfDestruct =>
+                                    format!("Expected call to {address:?} with {expected_values} to be called {count} time(s), but was called {actual_count} time(s)"),
+                                    _ => format!("Expected call to {address:?} with {expected_values} to be called {count} time(s), but the call reverted instead. Ensure you're testing the happy path when using the expectCall cheatcode"),
+                                };
                                 return (
                                     InstructionResult::Revert,
                                     remaining_gas,
-                                    format!(
-                                        "Expected call to {address:?} with {expected_values} to be called at least {count} time(s), but was called {actual_count} time(s)"
-                                    )
-                                    .encode()
-                                    .into(),
+                                    failure_message.encode().into(),
                                 )
                             }
                         }
                     }
                 }
+            }
+        }
+
+        // If the depth is 0, then this is the root call terminating
+        if data.journaled_state.depth() == 0 {
+            // See if there's a dangling expectRevert that should've been matched.
+            if self.expected_revert.is_some() {
+                return (
+                    InstructionResult::Revert,
+                    remaining_gas,
+                    "A `vm.expectRevert`was left dangling. Make sure that calls you expect to revert are external".encode().into(),
+                )
             }
 
             // Check if we have any leftover expected emits
@@ -890,13 +931,15 @@ where
             self.expected_emits.retain(|expected| !expected.found);
             // If not empty, we got mismatched emits
             if !self.expected_emits.is_empty() {
+                let failure_message = match status {
+                    InstructionResult::Continue | InstructionResult::Stop | InstructionResult::Return | InstructionResult::SelfDestruct =>
+                    "Expected an emit, but no logs were emitted afterward. You might have mismatched events or not enough events were emitted.",
+                    _ => "Expected an emit, but the call reverted instead. Ensure you're testing the happy path when using the `expectEmit` cheatcode.",
+                };
                 return (
                     InstructionResult::Revert,
                     remaining_gas,
-                    "Expected an emit, but no logs were emitted afterward. You might have mismatched events or not enough events were emitted."
-                        .to_string()
-                        .encode()
-                        .into(),
+                    failure_message.to_string().encode().into(),
                 )
             }
         }
@@ -1048,7 +1091,7 @@ where
 
         // Handle expected reverts
         if let Some(expected_revert) = &self.expected_revert {
-            if data.journaled_state.depth() <= expected_revert.depth {
+            if data.journaled_state.depth() == expected_revert.depth {
                 let expected_revert = std::mem::take(&mut self.expected_revert).unwrap();
                 return match handle_expect_revert(
                     true,
